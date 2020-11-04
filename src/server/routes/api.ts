@@ -20,6 +20,18 @@ const router = express.Router();
 const database = { url: '' };
 const env = (process.env.mode || process.env.NODE_ENV || process.env.ENV || 'development');
 
+const { PerformanceObserver, performance } = require('perf_hooks');
+const obs = new PerformanceObserver((items) => {
+    console.log(`
+        ${items.getEntries()[0].entryType},
+        ${items.getEntries()[0].name},
+        ${items.getEntries()[0].duration}
+    `);
+    performance.clearMarks();
+});
+obs.observe({ entryTypes: ['measure'] });
+performance.measure('Document DB Performance Test');
+
 // Uncomment when in need of verbose debugging
 /* mongoose.set('debug', function(coll, method, query, doc) {
     console.log(
@@ -49,7 +61,12 @@ if (process.env.MONGODB_HOST && process.env.MONGODB_PORT && process.env.APP_ENV)
     database.url = 'mongodb://localhost:27017/agora';
 }
 
+// DocumentDB
+database.url = '';
+performance.mark('dbConnection');
+
 mongoose.connect(database.url, { useNewUrlParser: true });
+performance.measure('dbConnection duration', 'dbConnection');
 
 // Get the default connection
 const connection = mongoose.connection;
@@ -84,8 +101,8 @@ connection.once('open', () => {
     const chartInfos: Map<string, any> = new Map<string, any>();
     const pChartInfos: Map<string, any> = new Map<string, any>();
 
-    // Group by id and sort by hgnc_symbol
-    Genes.aggregate(
+    performance.mark('geneAggregateCursor');
+    const geneAggregateCursor = Genes.aggregate(
         [
             {
                 $sort: {
@@ -110,10 +127,18 @@ connection.once('open', () => {
                 }
             }
         ]
-    ).allowDiskUse(true).exec().then(async (genes) => {
-        // All the genes, ordered by hgnc_symbol
-        allGenes = genes.slice();
+    ).cursor({
+        batchSize: 50000
+    }).allowDiskUse(true).exec();
+    performance.measure('geneAggregateCursor', 'geneAggregateCursor');
 
+
+    performance.mark('geneAggregateCursor.eachAsync');
+    geneAggregateCursor.eachAsync((data) => {
+        allGenes.push(data);
+    }, { parallel: 5000 }).then(async (gene) => {
+        performance.measure('geneAggregateCursor.eachAsync', 'geneAggregateCursor.eachAsync');
+        console.log("all genes length 1", allGenes.length)
         await allGenes.forEach((g) => {
             // Separate the columns we need
             g.logfc = getSignificantFigures(+g.logfc);
@@ -681,20 +706,26 @@ connection.once('open', () => {
     router.get('/genelist/:id', (req, res, next) => {
         // Return an empty array in case no id was passed or no params
         if (!req.params || !req.params.id) { res.json({ items: [] }); } else {
+            performance.mark('genelistFind1');
             GenesLinks.find({ geneA_ensembl_gene_id: req.params.id }).exec(async (err, links) => {
+                performance.measure('1st find to now', 'genelistFind1');
                 const arrA = await links.slice().map((slink) => {
                     return slink.toJSON()['geneB_ensembl_gene_id'];
                 });
 
+                performance.mark('genelistFind2');
                 GenesLinks.find({ geneB_ensembl_gene_id: req.params.id }, async (errB, linkB) => {
+                    performance.measure('2nd to now', 'genelistFind2');
                     const arrB = await linkB.slice().map((slink) => {
                         return slink.toJSON()['geneA_ensembl_gene_id'];
                     });
-                    const arr = [...arrA, ...arrB];
+                    const arr = [...arrA, ...arrB];  // has dup in this list, ex. ENSG00000132879
+                    performance.mark('genelistFind3');
                     GenesLinks.find({ geneA_ensembl_gene_id: { $in: arr } })
                         .where('geneB_ensembl_gene_id')
                         .in(arr)
                         .exec((errC, linksC) => {
+                            performance.measure('3rd to now', 'genelistFind3');
                             if (errC) {
                                 next(errC);
                             } else {
